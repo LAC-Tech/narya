@@ -1,0 +1,7 @@
+max_width = 80
+use_field_init_shorthand = true
+# TODO: enable these when rustfmt supports them in stable
+#fn_single_line = true
+#struct_lit_single_line = true
+#trailing_semicolon = false
+#wrap_comments = true
