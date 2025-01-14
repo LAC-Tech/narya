@@ -2,15 +2,17 @@
 //! Design around the 3 syscalls provided by the linux kernel, as exposed to
 //! rust via rustix.
 
-use core::{assert, assert_eq, assert_ne, cmp, mem, ptr};
+use core::{assert, assert_eq, assert_ne, cmp, mem, ptr, slice};
 use rustix::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
 use rustix::io_uring::{
     io_cqring_offsets, io_sqring_offsets, io_uring_cqe, io_uring_params,
-    io_uring_setup, IoringFeatureFlags, IoringSetupFlags, IORING_OFF_SQ_RING,
+    io_uring_setup, IoringFeatureFlags, IoringSetupFlags, IORING_OFF_SQES,
+    IORING_OFF_SQ_RING,
 };
-use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use rustix::mm;
+use rustix::mm::{MapFlags, ProtFlags};
 
 struct IoUring {
     fd: OwnedFd,
@@ -33,24 +35,42 @@ impl SubmissionQueue {
         assert!(fd.as_raw_fd() >= 0); // Extra paranoid sanity check
         assert!(p.features.contains(IoringFeatureFlags::SINGLE_MMAP));
 
-        let size: u32 = cmp::max(
+        let size: usize = cmp::max(
             p.sq_off.array + p.sq_entries * size_in_u32::<u32>(),
             p.cq_off.cqes + p.cq_entries * size_in_u32::<io_uring_cqe>(),
-        );
+        ) as usize;
 
         let mmap = unsafe {
-            mmap(
+            mm::mmap(
                 ptr::null_mut(),
-                size as usize,
+                size,
                 ProtFlags::READ | ProtFlags::WRITE,
                 MapFlags::SHARED | MapFlags::POPULATE,
                 fd,
                 IORING_OFF_SQ_RING,
-            ).map_err(|err] {
-
-            })?
+            )?
         };
 
+        let size_sqes =
+            (p.sq_entries as usize) + mem::size_of::<io_uring_cqe>();
+
+        let mmap_sqes = unsafe {
+            mm::mmap(
+                ptr::null_mut(),
+                size_sqes,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED | MapFlags::POPULATE,
+                fd,
+                IORING_OFF_SQES,
+            )?
+        };
+
+        let array = unsafe { slice::from_raw_parts_mut(mmap as *mut u8, size) };
+
+        let sqes =
+            unsafe { slice::from_raw_parts_mut(mmap_sqes as *mut u8, size) };
+
+        (array, sqes)
         panic!("construct submission queue");
     }
 }
