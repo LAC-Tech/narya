@@ -2,24 +2,62 @@
 //! Design around the 3 syscalls provided by the linux kernel, as exposed to
 //! rust via rustix.
 
-use core::{assert, assert_eq, assert_ne};
-use rustix::fd::AsRawFd;
+use core::{assert, assert_eq, assert_ne, cmp, mem, ptr};
+use rustix::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use rustix::io;
 use rustix::io::Errno;
 use rustix::io_uring::{
-    io_uring_params, io_uring_setup, IoringFeatureFlags, IoringSetupFlags,
+    io_cqring_offsets, io_sqring_offsets, io_uring_cqe, io_uring_params,
+    io_uring_setup, IoringFeatureFlags, IoringSetupFlags, IORING_OFF_SQ_RING,
 };
+use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 
 struct IoUring {
-    fd: rustix::fd::OwnedFd,
+    fd: OwnedFd,
     sq: SubmissionQueue,
     cq: CompletionQueue,
     flags: u32,
     features: u32,
 }
 
-struct SubmissionQueue {}
-struct CompletionQueue {}
+struct SubmissionQueue {
+    offsets: io_sqring_offsets,
+}
 
+fn size_in_u32<T>() -> u32 {
+    u32::try_from(mem::size_of::<T>()).unwrap()
+}
+
+impl SubmissionQueue {
+    fn new(fd: BorrowedFd, p: io_uring_params) -> io::Result<Self> {
+        assert!(fd.as_raw_fd() >= 0); // Extra paranoid sanity check
+        assert!(p.features.contains(IoringFeatureFlags::SINGLE_MMAP));
+
+        let size: u32 = cmp::max(
+            p.sq_off.array + p.sq_entries * size_in_u32::<u32>(),
+            p.cq_off.cqes + p.cq_entries * size_in_u32::<io_uring_cqe>(),
+        );
+
+        let mmap = unsafe {
+            mmap(
+                ptr::null_mut(),
+                size as usize,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED | MapFlags::POPULATE,
+                fd,
+                IORING_OFF_SQ_RING,
+            ).map_err(|err] {
+
+            })?
+        };
+
+        panic!("construct submission queue");
+    }
+}
+
+struct CompletionQueue {
+    offsets: io_cqring_offsets,
+}
 enum InitErr {
     EntriesZero,
     EntriesNotPowerOfTwo,
