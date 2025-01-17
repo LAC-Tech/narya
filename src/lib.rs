@@ -2,8 +2,8 @@
 //! Design around the 3 syscalls provided by the linux kernel, as exposed to
 //! rust via rustix.
 
-use core::{assert, assert_eq, assert_ne, cmp, mem, ptr, slice};
-use rustix::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use core::{assert, assert_eq, assert_ne, cmp, ffi, mem, ops, ptr, slice};
+use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
 use rustix::io_uring::{
@@ -28,6 +28,35 @@ struct SubmissionQueue {
 
 fn size_in_u32<T>() -> u32 {
     u32::try_from(mem::size_of::<T>()).unwrap()
+}
+
+// TODO: better name
+struct MemMapped {
+    len: usize,
+    ptr: *mut ffi::c_void,
+}
+
+impl MemMapped {
+    fn new<Fd: AsFd>(len: usize, fd: Fd) -> io::Result<Self> {
+        unsafe {
+            let ptr = mm::mmap(
+                ptr::null_mut(),
+                len,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED | MapFlags::POPULATE,
+                fd,
+                IORING_OFF_SQ_RING,
+            )?;
+
+            Ok(Self { len, ptr })
+        }
+    }
+}
+
+impl ops::Drop for MemMapped {
+    fn drop(&mut self) {
+        unsafe { mm::munmap(self.ptr, self.len).unwrap() }
+    }
 }
 
 impl SubmissionQueue {
@@ -70,7 +99,6 @@ impl SubmissionQueue {
         let sqes =
             unsafe { slice::from_raw_parts_mut(mmap_sqes as *mut u8, size) };
 
-        (array, sqes)
         panic!("construct submission queue");
     }
 }
