@@ -8,22 +8,24 @@ use rustix::io;
 use rustix::io::Errno;
 use rustix::io_uring::{
     io_cqring_offsets, io_sqring_offsets, io_uring_cqe, io_uring_params,
-    io_uring_setup, IoringFeatureFlags, IoringSetupFlags, IORING_OFF_SQES,
-    IORING_OFF_SQ_RING,
+    io_uring_setup, io_uring_sqe, IoringFeatureFlags, IoringSetupFlags,
+    IORING_OFF_SQES, IORING_OFF_SQ_RING,
 };
 use rustix::mm;
 use rustix::mm::{MapFlags, ProtFlags};
 
-struct IoUring {
+struct IoUring<'a> {
     fd: OwnedFd,
-    sq: SubmissionQueue,
+    sq: SubmissionQueue<'a>,
     cq: CompletionQueue,
     flags: u32,
     features: u32,
 }
 
-struct SubmissionQueue {
+struct SubmissionQueue<'a> {
     offsets: io_sqring_offsets,
+    array: MmapSlice<'a, u32>,
+    sqes: MmapSlice<'a, io_uring_sqe>,
 }
 
 fn size_in_u32<T>() -> u32 {
@@ -31,35 +33,51 @@ fn size_in_u32<T>() -> u32 {
 }
 
 // TODO: better name
-struct MemMapped {
-    len: usize,
-    ptr: *mut ffi::c_void,
+struct MmapSlice<'a, T: Copy + Clone>(&'a [T]);
+
+impl<'a, T: Copy + Clone> MmapSlice<'a, T> {
+    unsafe fn new<Fd: AsFd>(
+        len_in_bytes: usize,
+        fd: Fd,
+        mmap_offset: u64,
+        slice_offset: usize,
+    ) -> io::Result<Self> {
+        let elem_size = mem::size_of::<T>();
+        assert_eq!(len_in_bytes % elem_size, 0);
+        let element_count = len_in_bytes / elem_size;
+
+        let ptr = mm::mmap(
+            ptr::null_mut(),
+            len_in_bytes,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED | MapFlags::POPULATE,
+            fd,
+            mmap_offset,
+        )?;
+
+        assert_eq!(slice_offset % elem_size, 0);
+        let element_offset = slice_offset / elem_size;
+
+        let slice = slice::from_raw_parts(ptr as *const T, element_count);
+        let adjusted_slice = &slice[element_offset..];
+
+        Ok(Self(adjusted_slice))
+    }
 }
 
-impl MemMapped {
-    fn new<Fd: AsFd>(len: usize, fd: Fd) -> io::Result<Self> {
+impl<T: Copy + Clone> Drop for MmapSlice<'_, T> {
+    fn drop(&mut self) {
         unsafe {
-            let ptr = mm::mmap(
-                ptr::null_mut(),
-                len,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::SHARED | MapFlags::POPULATE,
-                fd,
-                IORING_OFF_SQ_RING,
-            )?;
+            let (ptr, len) = (self.0.as_ptr() as *mut _, self.0.len());
 
-            Ok(Self { len, ptr })
+            if let Err(errno) = mm::munmap(ptr, len) {
+                panic!("Unexpected error when memory un-mapping: {}", errno);
+            }
         }
     }
 }
 
-impl ops::Drop for MemMapped {
-    fn drop(&mut self) {
-        unsafe { mm::munmap(self.ptr, self.len).unwrap() }
-    }
-}
-
-impl SubmissionQueue {
+impl SubmissionQueue<'_> {
     fn new(fd: BorrowedFd, p: io_uring_params) -> io::Result<Self> {
         assert!(fd.as_raw_fd() >= 0); // Extra paranoid sanity check
         assert!(p.features.contains(IoringFeatureFlags::SINGLE_MMAP));
@@ -69,35 +87,20 @@ impl SubmissionQueue {
             p.cq_off.cqes + p.cq_entries * size_in_u32::<io_uring_cqe>(),
         ) as usize;
 
-        let mmap = unsafe {
-            mm::mmap(
-                ptr::null_mut(),
-                size,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::SHARED | MapFlags::POPULATE,
-                fd,
-                IORING_OFF_SQ_RING,
-            )?
-        };
+        let array =
+            unsafe { MmapSlice::<u32>::new(size, fd, IORING_OFF_SQ_RING, 0)? };
 
         let size_sqes =
             (p.sq_entries as usize) + mem::size_of::<io_uring_cqe>();
 
         let mmap_sqes = unsafe {
-            mm::mmap(
-                ptr::null_mut(),
+            MmapSlice::<io_uring_sqe>::new(
                 size_sqes,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::SHARED | MapFlags::POPULATE,
                 fd,
                 IORING_OFF_SQES,
+                p.sq_off.ring_entries as usize,
             )?
         };
-
-        let array = unsafe { slice::from_raw_parts_mut(mmap as *mut u8, size) };
-
-        let sqes =
-            unsafe { slice::from_raw_parts_mut(mmap_sqes as *mut u8, size) };
 
         panic!("construct submission queue");
     }
@@ -119,7 +122,7 @@ enum InitErr {
     UnexpectedErrno(Errno),
 }
 
-impl IoUring {
+impl IoUring<'_> {
     /**
      * A friendly way to setup an io_uring, with default linux.io_uring_params.
      * `entries` must be a power of two between 1 and 32768, although the kernel
